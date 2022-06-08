@@ -23,6 +23,14 @@ int main(int argc, char *argv[]) {
     ssize_t textLen;
     BApplication app("application/x-vnd.luuvki.CopyPasted");
 	
+#ifdef WIN32
+	if (!getenv("HOME")) putenv("HOME=C:\\");
+#else
+
+#endif
+	
+	printf("Home folder <%s>\n", getenv("HOME"));
+	
     int sockfd, portno, n;
     struct sockaddr_in serv_addr;
 
