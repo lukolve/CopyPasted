@@ -1,3 +1,22 @@
-all:
-	g++ -lbe -lnetwork  -o client client.cpp
-	gcc -lnetwork -o server_single server_single.c
+# Name of our executable binary
+TARGET = CopyPaste
+
+# Compiler and flags
+CXX = g++
+CXXFLAGS = -Wall -O2
+
+# Add Haiku's system headers
+CXXFLAGS += -I/boot/system/develop/headers -I/boot/system/develop/headers/private/netservices
+
+# Haiku specific libraries needed (libbe handles BApplication and BClipboard)
+LIBS = -lbe -lnetwork
+
+# Source files
+SRCS = main.cpp
+
+# Default rule
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CXX) $(CXXFLAGS) $(SRCS) -o $(TARGET) $(LIBS)
+
