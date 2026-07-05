@@ -1,33 +1,27 @@
-// Pure Haiku implementation of CopyPasted
-//
-// MIT License by lukolve
-//
-// pkgman install devel:libnetwork
-
 #include <Application.h>
 #include <Clipboard.h>
 #include <Message.h>
 #include <MessageFilter.h>
-#include <SupportDefs.h>
-#include <Url.h>
-#include <UrlProtocolRoster.h>
-#include <UrlRequest.h>
-#include <File.h>
+#include <String.h>
+#include <Roster.h>
 #include <stdio.h>
 #include <string.h>
 
-using namespace BPrivate::Network;
+// Hlavičkové súbory pre BSD sokety a asynchrónne vlákna
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <thread>
+#include <string>
 
-// Definicia vlastnej spravy pre nasu skratku
+// Konfigurácia tvojho C++ servera
+const char* SERVER_IP = "192.168.0.100";
+const int SERVER_PORT = 5000;
+
+// Naša vlastná správa pre vyvolanie vloženia zo servera
 const uint32 MSG_ALT_PASTE = 'alps';
 
-const char* SERVER_URL_GET = "http://192.168.1.100:5000/get_clipboard"; // Uprav IP
-const char* SERVER_URL_CLEAR = "http://192.168.1.100:5000/clear_clipboard";
-
-//#define SERVER_URL_GET "http://192.168.1.100:5000/get_clipboard" // Uprav IP
-//#define SERVER_URL_CLEAR "http://192.168.1.100:5000/clear_clipboard"
-
-// --- KROK 2 & 3: Filter klavesnice ---
+// --- Globalny filter klavesnice ---
 filter_result KeyFilter(BMessage* message, BHandler** target, BMessageFilter* filter)
 {
     int32 modifiers;
@@ -36,164 +30,197 @@ filter_result KeyFilter(BMessage* message, BHandler** target, BMessageFilter* fi
     if (message->FindInt32("modifiers", &modifiers) == B_OK
         && message->FindInt32("key", &key) == B_OK) {
         
-        // B_COMMAND_KEY je v Haiku standardne Alt (alebo Win klaves podla nastavenia)
-        // Klaves 'v' ma na standardnej klavesnici vacsinou kod 0x5b alebo to overime cez b_key
         const char* bytes;
         if (message->FindString("bytes", &bytes) == B_OK && strcmp(bytes, "v") == 0) {
+            // B_COMMAND_KEY je v Haiku standardne klaves Alt
             if ((modifiers & B_COMMAND_KEY) != 0) {
-                // Zachytili sme Alt+V, posleme spravu nasej aplikacii
-                be_app->PostMessage(MSG_ALT_PASTE);
-                return B_SKIP_MESSAGE; // Ignorujeme povodnu spravu, spracujeme ju sami
+                if (filter && filter->Looper()) {
+                    // Bezpečne pošleme správu loopru (aplikácii)
+                    filter->Looper()->PostMessage(MSG_ALT_PASTE);
+                }
+                return B_SKIP_MESSAGE; // Ignorujeme povodnu spravu v systéme
             }
         }
     }
     return B_DISPATCH_MESSAGE;
 }
 
-// We define our own Application class by inheriting from BApplication
-class CopyPasteApp : public BApplication {
-public:
-    // Constructor: we give our app a unique signature
-    CopyPasteApp() : BApplication("application/x-vnd.CopyPasteApp") {
-        printf("CopyPasteApp started. Watching clipboard... Press Ctrl+C to exit.\n");
-        
-        // Pridame globalny filter na klavesnicu pre celu aplikaciu
-        fFilter = new BMessageFilter(B_KEY_DOWN, KeyFilter);
-        AddCommonFilter(fFilter);
-        printf("CopyPasteApp client side app started. Press Alt+V...\n");
+// --- SÚČASŤ 1: Odoslanie lokálnej schránky na server (Ctrl+C / Copy) ---
+void OdosliNaServerNaPozadi(BString textNaOdoslanie) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return;
+
+    struct sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(SERVER_PORT);
+    
+    if (inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr) <= 0 ||
+        connect(sock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        close(sock);
+        return;
     }
 
-~CopyPasteApp()
-    {
+    // Keďže píšeš vlastný server v C++, posielame minimalistický HTTP POST požiadavok.
+    // Ak tvoj server nebude spracovávať HTTP, môžeš poslať priamo surový text.
+    std::string request = "POST /set_clipboard HTTP/1.1\r\n";
+    request += "Host: " + std::string(SERVER_IP) + "\r\n";
+    request += "Content-Length: " + std::to_string(textNaOdoslanie.Length()) + "\r\n";
+    request += "Connection: close\r\n\r\n";
+    request += textNaOdoslanie.String();
+
+    send(sock, request.c_str(), request.length(), 0);
+    close(sock);
+    printf("[Soket] Schránka bola odoslaná na server.\n");
+}
+
+// --- SÚČASŤ 2: Stiahnutie zo servera a vloženie (Alt+V / Paste) ---
+void SpracujPasteNaPozadi() {
+    printf("[Soket] Pripájanie k serveru pre stiahnutie dát...\n");
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return;
+
+    struct sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(SERVER_PORT);
+    
+    if (inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr) <= 0 ||
+        connect(sock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        printf("[Soket - ERROR] Server je nedostupný.\n");
+        close(sock);
+        return;
+    }
+
+    // Posielame HTTP GET na získanie schránky
+    std::string request = "GET /get_clipboard HTTP/1.1\r\n";
+    request += "Host: " + std::string(SERVER_IP) + "\r\n";
+    request += "Connection: close\r\n\r\n";
+
+    send(sock, request.c_str(), request.length(), 0);
+
+    // Čítanie odpovede zo soketu
+    char buffer[1024];
+    std::string httpResponse = "";
+    ssize_t bytesRead;
+    while ((bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytesRead] = '\0';
+        httpResponse += buffer;
+    }
+    close(sock);
+
+    // Oddelenie HTTP hlavičiek od samotného tela textu
+    std::string stiahnutyText = "";
+    size_t bodyPos = httpResponse.find("\r\n\r\n");
+    if (bodyPos != std::string::npos) {
+        stiahnutyText = httpResponse.substr(bodyPos + 4);
+    }
+
+    if (stiahnutyText.empty()) {
+        printf("[Soket - INFO] Server vrátil prázdny text.\n");
+        return;
+    }
+
+    printf("[Soket - SUCCESS] Stiahnutý text: %s\n", stiahnutyText.c_str());
+
+    // Vloženie stiahnutého textu do systémového clipboardu Haiku
+    if (be_clipboard->Lock()) {
+        be_clipboard->Clear();
+        BMessage* clipData = be_clipboard->Data();
+        if (clipData != NULL) {
+            clipData->AddData("text/plain", B_MIME_TYPE, stiahnutyText.c_str(), stiahnutyText.length());
+            be_clipboard->Commit();
+            printf("[Soket] Dáta zapísané do Haiku schránky.\n");
+        }
+        be_clipboard->Unlock();
+    }
+
+    // Automatická simulácia stlačenia "Paste" (odoslanie správy aktívnej aplikácii)
+    app_info info;
+    if (be_roster->GetActiveAppInfo(&info) == B_OK) {
+        BMessenger targetApp(info.signature);
+        if (targetApp.IsValid()) {
+            targetApp.SendMessage(B_PASTE);
+            printf("[Soket] Odoslaná správa B_PASTE pre: %s\n", info.signature);
+        }
+    }
+
+    // Spätná väzba serveru - poslanie požiadavky na vyčistenie (/clear_clipboard)
+    int clearSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (clearSock >= 0) {
+        if (connect(clearSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) >= 0) {
+            std::string clearRequest = "GET /clear_clipboard HTTP/1.1\r\n";
+            clearRequest += "Host: " + std::string(SERVER_IP) + "\r\n";
+            clearRequest += "Connection: close\r\n\r\n";
+            send(clearSock, clearRequest.c_str(), clearRequest.length(), 0);
+            while (recv(clearSock, buffer, sizeof(buffer) - 1, 0) > 0); // Vyprázdnenie buffra
+        }
+        close(clearSock);
+    }
+}
+
+// --- Hlavná trieda aplikácie ---
+class CopyPasteApp : public BApplication {
+public:
+    CopyPasteApp() : BApplication("application/x-vnd.CopyPasteApp") {
+        printf("CopyPasteApp started.\n");
+        printf("Watching local clipboard (Alt+C) and listening for Alt+V...\n");
+        
+        // Registrácia globálneho filtra klávesnice
+        fFilter = new BMessageFilter(B_KEY_DOWN, KeyFilter);
+        AddCommonFilter(fFilter);
+    }
+
+    ~CopyPasteApp() {
         Lock();
         RemoveCommonFilter(fFilter);
         delete fFilter;
         Unlock();
     }
 
-
-    // This method is called automatically right after the application starts
     void ReadyToRun() override {
-        // Tell the system clipboard to send a message to our app whenever it changes
+        // Sledovanie zmien lokálneho clipboardu
         be_clipboard->StartWatching(be_app_messenger);
     }
 
-    // This is the core loop where the app receives and processes system events/messages
     void MessageReceived(BMessage* message) override {
         switch (message->what) {
             case B_CLIPBOARD_CHANGED: {
                 printf("\n[!] Clipboard update detected!\n");
                 
-                // We must lock the clipboard before reading from it
                 if (be_clipboard->Lock()) {
                     BMessage* clipData = be_clipboard->Data();
                     const char* text = nullptr;
                     ssize_t textLen = 0;
 
-                    // Extract text data from the clipboard message
-                    // "text/plain" is the standard MIME type for unformatted text
                     if (clipData->FindData("text/plain", B_MIME_TYPE, (const void**)&text, &textLen) == B_OK) {
-                        // Create a safe null-terminated string to print
                         BString copiedText(text, textLen);
                         printf("Copied text: %s\n", copiedText.String());
-                    } else {
-                        printf("Clipboard changed, but it doesn't contain plain text.\n");
-                    }
 
-                    // Always unlock the clipboard when done!
+                        // Asynchrónne odoslanie na server
+                        std::thread(OdosliNaServerNaPozadi, copiedText).detach();
+                    }
                     be_clipboard->Unlock();
                 }
                 break;
-            case MSG_ALT_PASTE:
-                SpracujAltPaste();
+            }
+            
+            case MSG_ALT_PASTE: {
+                // Používateľ stlačil skratku, asynchrónne sťahujeme zo servera
+                std::thread(SpracujPasteNaPozadi).detach();
                 break;
             }
+            
             default:
-                // Pass any other unhandled messages to the base class
                 BApplication::MessageReceived(message);
                 break;
         }
     }
-    
+
 private:
     BMessageFilter* fFilter;
-    
-    void SpracujAltPaste()
-    {
-        printf("[INFO] I see there is pressed Alt+V. Connecting to server...\n");
-
-        // 1. Stiahnutie dat z weboveho servera (Krok 2)
-        BUrl url(SERVER_URL_GET,false);
-        //BUrl url(urlString);
-        BMallocIO replyBuffer; // Sem ulozime odpoved zo servera
-        
-        // V Haiku standardne pouzivame UrlProtocolRoster na sietove poziadavky
-        BUrlRequest* request = BUrlProtocolRoster::MakeRequest(url, &replyBuffer);
-        if (request == NULL) {
-            printf("[ERROR] Nepodarilo sa vytvorit sietovy poziadavok.\n");
-            return;
-        }
-
-        status_t thread = request->Run();
-        wait_for_thread(thread, NULL);
-        delete request;
-
-        // Predpokladajme, ze server zatial vracia len cisty text (nie JSON), aby sme si to v C++ nekomplikovali
-        // Ak vracia JSON {"obsah": "text"}, museli by sme pouzit BMessage s JSON prekladacom, 
-        // takze pre test BeAPI staci, ak tvoj server vrati iba cisty text ako string.
-        
-        size_t dataSize = replyBuffer.BufferLength();
-        if (dataSize == 0) {
-            printf("[INFO] Server gets clear message.\n");
-            return;
-        }
-
-        char* stiahnutyText = (char*)malloc(dataSize + 1);
-        memcpy(stiahnutyText, replyBuffer.Buffer(), dataSize);
-        stiahnutyText[dataSize] = '\0';
-
-        printf("[INFO] Downloaded message: %s\n", stiahnutyText);
-
-        // 2. Vlozenie do systemoveho BeAPI Clipboardu
-        if (be_clipboard->Lock()) {
-            be_clipboard->Clear();
-            
-            BMessage* clipData = be_clipboard->Data();
-            if (clipData != NULL) {
-                // BeAPI pouziva na text typ "text/plain"
-                clipData->AddData("text/plain", B_MIME_TYPE, stiahnutyText, dataSize);
-                be_clipboard->Commit();
-                printf("[INFO] Data writed to BeOS clipboard.\n");
-            }
-            be_clipboard->Unlock();
-        }
-        
-        free(stiahnutyText);
-
-        // TODO: Tu by nasledovala simulacia systemoveho "Paste" do aktualneho okna.
-        // V Haiku sa to robi poslanim B_PASTE spravy aktivnemu oknu (view),
-        // ale kedze sme skratku zachytili, pouzivatel moze hned stlacit standardne Paste,
-        // alebo docielime auto-paste. Pre test staci, ze to uz mas v clipboarde.
-
-        // 3. Krok 3: Poslanie poziadavky na uvolnenie serveru (POST alebo GET na /clear)
-        printf("[INFO] Posielam poziadavok na uvolnenie serveru...\n");
-        
-        //BString clearUrlString
-        BUrl clearUrl(SERVER_URL_CLEAR,false);
-        //BUrl clearUrl(clearUrlString);
-        BMallocIO clearReply;
-        BUrlRequest* clearRequest = BUrlProtocolRoster::MakeRequest(clearUrl, &clearReply);
-        if (clearRequest != NULL) {
-            status_t cThread = clearRequest->Run();
-            wait_for_thread(cThread, NULL);
-            delete clearRequest;
-            printf("[SUCCESS] Server gets clear request.\n");
-        }
-    }
 };
 
 int main() {
-    // Create an instance of our application and run its main loop
     CopyPasteApp app;
     app.Run();
     return 0;
